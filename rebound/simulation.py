@@ -199,9 +199,48 @@ class Simulation(Structure):
         You can access a running server by opening a web browser
         at http://localhost:1234 or http://127.0.0.1:1234
         """
-        clibrebound.reb_simulation_start_server.restype = c_int
-        ret_value = clibrebound.reb_simulation_start_server(byref(self), c_int(port))
-        self.process_messages()
+        # If running on the browser
+        if sys.platform == 'emscripten':
+            self.start_pyodide_server()
+        else:
+            clibrebound.reb_simulation_start_server.restype = c_int
+            ret_value = clibrebound.reb_simulation_start_server(byref(self), c_int(port))
+            self.process_messages()
+    
+    def start_pyodide_server(self):
+        import js
+        from pyodide.ffi import create_proxy
+
+        # Start web worker off main window to run simulation
+        workercode = self.get_webworker_code()
+        blob = js.Blob.new([workercode], { type: "application/javascript" })
+        workerurl = js.URL.createObjectURL(blob)
+
+        pyodideWorker = js.Worker.new(workerurl)
+
+        # Open the visualization window
+        win = js.window.open("rebound.html","",'width=800,height=400,screenX=200,screenY=200')
+
+        # Create message channel to communicate between main window and visualization window
+        channel = js.MessageChannel.new()
+        port1, port2 = channel.port1, channel.port2
+
+        # API for visualization window, should forward requests to web worker 
+        def port_onmessage(e):
+            data = e.data.to_py()
+            if data["type"] == "init":
+                print("Communication established with visualization window")
+            elif data["type"] == "keyboard":
+                print(data["data"])
+                
+        port1.onmessage = create_proxy(port_onmessage)
+
+        def init_new_window_with_port():
+            win.postMessage("Init", "*", [port2])
+
+        # Run with a delay to enable the visualization window to instantiate
+        js.setTimeout(create_proxy(init_new_window_with_port), 500)
+        
     
     def stop_server(self, port=1234):
         """
@@ -248,6 +287,36 @@ class Simulation(Structure):
         Do not set manually. Use sim.save_to_file() instead
         """
         return self._simulationarchive_filename
+    
+    # Stringified web worker code for browser visualization
+    def get_webworker_code(self):
+        """
+        Returns the webworker code to be run from the main browser
+        window as a string. 
+        
+        """
+        return '''
+            importScripts("https://cdn.jsdelivr.net/pyodide/v0.25.0/full/pyodide.js");
+            let pyodideReadyPromise = loadPyodide();
+
+            self.onmessage = async (event) => {
+                // make sure loading is done
+                const pyodide = await pyodideReadyPromise;
+                const { id, python, context } = event.data;
+                // Now load any packages we need, run the code, and send the result back.
+                await pyodide.loadPackagesFromImports(python);
+                // make a Python dictionary with the data from `context`
+                const dict = pyodide.globals.get("dict");
+                const globals = dict(Object.entries(context));
+                try {
+                    // Execute the python code in this context
+                    const result = await pyodide.runPythonAsync(python, { globals });
+                    self.postMessage({ result, id });
+                } catch (error) {
+                    self.postMessage({ error: error.message, id });
+                }
+            };
+        '''
 
 # Message and memory management functions
     def process_messages(self):
